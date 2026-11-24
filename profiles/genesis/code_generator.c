@@ -25,6 +25,22 @@
 #include <stdint.h>
 #include <ctype.h>
 
+/* tmpfile() on Windows can try to create its file in the root of the current
+ * drive, which ordinary users can't write: use the user's temp folder
+ * (%TMP%, else the current folder), opened with "D" so it is deleted on
+ * close like tmpfile(). */
+static FILE *portable_tmpfile(void)
+{
+#ifdef _WIN32
+    char *name = _tempnam(".", "grc");
+    FILE *f = name ? fopen(name, "w+bD") : NULL;
+    free(name);
+    return f;
+#else
+    return tmpfile();
+#endif
+}
+
 /* Current-instruction context for diagnostics, set at the top of
  * emit_instr and read by helpers (e.g., emit_ea_store_ex) so they can
  * attribute diagnostics to the right ROM PC and containing function
@@ -362,6 +378,10 @@ void codegen_set_dump_functions_path(const char *path) {
  * emit_instr signature stays unchanged.
  */
 static bool g_yield_in_next_bne = false;
+/* Set by emit_instr when an instruction charged its own cycles at the
+ * hardware-correct point (before a callee runs: JSR/BSR, TRAP to a native
+ * handler), so the per-instruction tail must not charge them again. */
+static bool s_instr_cycles_charged = false;
 
 static const char *size_write_fn(M68KSize sz) {
     switch (sz) {
@@ -2116,14 +2136,16 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         uint32_t handler;
         if (function_finder_trap_handler(rom, trap_num, &handler) &&
             func_is_known(handler)) {
-            /* Cycles are charged by the per-instruction tail after this
-             * case, as for JSR; charging here too would double-count. */
+            /* Cycles are charged inside the block, after the exception
+             * frame is built and before the handler runs (as for JSR). */
             fprintf(f, "  { /* TRAP #%u -> $%06X */\n", trap_num, handler);
             fprintf(f, "    uint16_t _trap_sr = g_cpu.SR;\n");
             fprintf(f, "    g_cpu.A[7] -= 4; m68k_write32(g_cpu.A[7], 0x%06Xu); /* push PC */\n",
                     instr->addr + instr->byte_length);
             fprintf(f, "    g_cpu.A[7] -= 2; m68k_write16(g_cpu.A[7], _trap_sr); /* push SR */\n");
             fprintf(f, "    g_cpu.SR = (uint16_t)((_trap_sr | 0x2000u) & 0x7FFFu); /* S=1, T=0 */\n");
+            emit_cycle_accounting(f, "    ", estimate_cycles(instr));
+            s_instr_cycles_charged = true;
             fprintf(f, "    int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n");
             fprintf(f, "    recomp_call_func(func_%06X);\n", handler);
             fprintf(f, "    g_split_sp_popped = _saved_split_sp_popped;\n");
@@ -2221,6 +2243,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             function_finder_pops_return_unconditionally(rom, instr->target_addr)) {
             fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push (callee captures return) */\n",
                     ret_addr);
+            /* The JSR's cycles elapse before the callee's first instruction
+             * (as on hardware and in m68k_interp), not after it returns. */
+            emit_cycle_accounting(f, "  ", estimate_cycles(instr));
+            s_instr_cycles_charged = true;
             fprintf(f, "  { int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n");
             if (func_is_native_rom(rom,instr->target_addr))
                 fprintf(f, "    RECOMP_CALL_NATIVE(func_%06X);\n", instr->target_addr);
@@ -2229,7 +2255,6 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             fprintf(f, "    g_split_sp_popped = _saved_split_sp_popped;\n");
             fprintf(f, "  }\n");
             fprintf(f, "  g_rte_pending = 0; /* callee captured our return; handled here */\n");
-            emit_cycle_accounting(f, "  ", estimate_cycles(instr));
             fprintf(f, "  return; /* callee captured return addr: no pop, no fall-through */\n");
             *skip_until_label = true;
             break;
@@ -2241,6 +2266,12 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f, "  uint32_t _jsr_pre_sp_%06X = g_cpu.A[7];\n", addr);
         fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push */\n", ret_addr);
         fprintf(f, "  uint32_t _jsr_slot_sp_%06X = g_cpu.A[7];\n", addr);
+        /* Charge the JSR/BSR here, after its push and before the callee, as
+         * hardware and m68k_interp do. Charging after the call returned made
+         * every callee run early by 20/18 cycles per nesting level, which
+         * moved raster-dependent VDP stalls and Z80 timing (pairing #1). */
+        emit_cycle_accounting(f, "  ", estimate_cycles(instr));
+        s_instr_cycles_charged = true;
 
         if (instr->has_target) {
             fprintf(f, "  { int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n");
@@ -2315,8 +2346,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * pop keeps A7 in sync with hardware. Consume one skipped return
          * slot; additional skipped slots continue through outer callers. */
         fprintf(f, "  if (g_rte_pending) { --g_rte_pending;\n");
-        emit_cycle_accounting(f, "    ", estimate_cycles(instr));
-        fprintf(f, "    return; } /* RTE/skip propagation (pre-pop) */\n");
+        fprintf(f, "    return; } /* RTE/skip propagation (pre-pop; cycles already charged) */\n");
         fprintf(f,
                 "  if (g_cpu.A[7] != (uint32_t)(_jsr_slot_sp_%06X + 4u))\n"
                 "    g_cpu.A[7] += 4; /* normal JSR pop */\n"
@@ -2579,7 +2609,15 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                                      estimate_cycles(instr));
             }
         }
-        fprintf(f, "    }\n  }\n");
+        fprintf(f, "    }\n");
+        /* 68000 DBcc timing by outcome: 10 when it loops (charged above),
+         * 14 when the counter expires, 12 when the condition is true. A single
+         * per-instruction cost charged 10 on both exits. */
+        emit_cycle_accounting(f, "    ", 14);
+        fprintf(f, "  } else {\n");
+        emit_cycle_accounting(f, "    ", 12);
+        fprintf(f, "  }\n");
+        s_instr_cycles_charged = true;
         break;
     }
 
@@ -3002,11 +3040,24 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         emit_ea_load(f, instr, instr->src_ea, sz, &er, tmp, src_expr);
         char res[64];
         snprintf(res, sizeof(res), "_%06Xr", addr);
-        fprintf(f, "  %s %s = (%s)((%s)(%s) - (%s)0x%Xu);\n",
-                ct, res, ct, ct, src_expr, ct, imm);
+        /* [widescreen] addimm/subimm on a cmpi: widen the compared bound by
+         * +/-(g_ws_margin>>shift) (e.g. a sprite or object cull edge), without
+         * touching the compared register. margin 0 => identical. */
+        char immx[128];
+        const WsSite *_wsk = ws_site_for_kind(addr, WS_SITE_ADDIMM, WS_SITE_SUBIMM);
+        if (_wsk && (_wsk->kind == WS_SITE_ADDIMM || _wsk->kind == WS_SITE_SUBIMM)) {
+            fprintf(f, "  /* [widescreen] cmpi #imm %s (g_ws_margin>>%u) */\n",
+                    _wsk->kind == WS_SITE_ADDIMM ? "+" : "-", _wsk->shift);
+            snprintf(immx, sizeof(immx), "(%s)((int32_t)0x%Xu %s (int32_t)(g_ws_margin >> %u))",
+                     ct, imm, _wsk->kind == WS_SITE_ADDIMM ? "+" : "-", _wsk->shift);
+        } else {
+            snprintf(immx, sizeof(immx), "(%s)0x%Xu", ct, imm);
+        }
+        fprintf(f, "  %s %s = (%s)((%s)(%s) - %s);\n",
+                ct, res, ct, ct, src_expr, immx);
         char da[256], db[256];
         snprintf(da, sizeof(da), "(%s)(%s)", ct, src_expr);
-        snprintf(db, sizeof(db), "(%s)0x%Xu", ct, imm);
+        snprintf(db, sizeof(db), "%s", immx);
         emit_flags_cmp(f, da, db, res, sz);
         break;
     }
@@ -4273,6 +4324,7 @@ bool codegen_emit_step_semantics(FILE *f, const GenesisRom *rom,
     bool skip = false;
     int stack_accounting = 0;
     emit_instr(f, rom, ins, &instructions, &skip, &stack_accounting, "<step>", ins->addr, false);
+    s_instr_cycles_charged = false;   /* step modules charge via ctx */
     s_ws_sites = saved_sites; s_ws_site_count = saved_count;
     s_reverse_debug = saved_reverse;
     s_diag_func_name = saved_name; s_diag_func_addr = saved_addr; s_diag_instr = saved_ins;
@@ -4371,6 +4423,7 @@ static bool emit_step_control(FILE *f,const GenesisRom *rom,const M68KInstr *ins
          * qualification. Zero division enters the real vector-five frame. */
         fprintf(f,"  ctx->charge=%u;\n",(ins->mnemonic==MN_DIVU?140u:158u)+step_operand_cost((unsigned)ins->src_ea,false));
         emit_instr(f,rom,ins,&instructions,&skip,&stack_accounting,"<step>",ins->addr,true);
+        s_instr_cycles_charged = false;
         addrset_free(&instructions);return !skip;
     }
     case MN_CHK: {
@@ -4466,7 +4519,7 @@ static bool owned_rmw_same_ea(const char*body,size_t a,size_t a_end,size_t b,siz
 bool codegen_emit_owned_rmw_operation(FILE*out,const GenesisRom*rom,const M68KInstr*ins)
 {
     if(!out||!rom||!codegen_owned_rmw_instruction(ins))return false;
-    FILE*buffer=tmpfile();if(!buffer)return false;
+    FILE*buffer=portable_tmpfile();if(!buffer)return false;
     bool ok=codegen_emit_step_operation(buffer,rom,ins)&&!fflush(buffer);
     long size=ok?ftell(buffer):-1;char*body=NULL;bool emitted=false;
     if(size<=0||size>1048576||fseek(buffer,0,SEEK_SET))goto done;
@@ -4592,7 +4645,7 @@ bool codegen_emit_register_span(FILE *out,const GenesisRom *rom,const M68KInstr 
            (n && ins[n-1].addr+ins[n-1].byte_length!=ins[n].addr))return false;
         live[n]=need;need=(need&~written)|read;
     }
-    FILE *buffer=tmpfile();if(!buffer)return false;
+    FILE *buffer=portable_tmpfile();if(!buffer)return false;
     bool old_active=s_span_flags;unsigned old_live=s_span_live_flags;
     s_span_flags=true;
     bool okay=true;
@@ -5084,9 +5137,9 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         /* Buffer this function's full emission (through both possible exit
          * points below) so its exact byte size is known before deciding
          * which balanced part file it lands in. See part_buf_push(). */
-        FILE *f_func = tmpfile();
+        FILE *f_func = portable_tmpfile();
         if (!f_func) {
-            fprintf(stderr, "codegen: tmpfile() failed while emitting func_%06X\n",
+            fprintf(stderr, "codegen: portable_tmpfile() failed while emitting func_%06X\n",
                     func_addr);
             free(entry_owners);
             addrset_free(&hard_boundaries);
@@ -5430,7 +5483,14 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
              * matching the interpreter's interrupt-driven behavior. */
             {
                 int cyc = estimate_cycles(&instr);
-                emit_cycle_accounting(f_func, "  ", cyc);
+                /* A Bcc reaching this tail fell through: the 68000 charges 8
+                 * (.b) or 12 (.w) when the branch is not taken; the taken
+                 * paths above charge the table's taken cost. */
+                if (instr.mnemonic == MN_Bcc && instr.has_target)
+                    cyc = instr.word_count == 1 ? 8 : 12;
+                if (!s_instr_cycles_charged)
+                    emit_cycle_accounting(f_func, "  ", cyc);
+                s_instr_cycles_charged = false;
             }
 
             /* Two valid entry streams can overlap in ROM. Sorted emission
